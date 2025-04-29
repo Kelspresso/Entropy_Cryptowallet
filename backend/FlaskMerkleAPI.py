@@ -1,153 +1,79 @@
-# Flask backend for hybrid PoSp-PoW Merkle verification
-from flask import Flask, jsonify, request
+# FlaskMerkleAPI.py
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import hashlib
-import os
-import base64
-from datetime import datetime
+from merkletools import MerkleTools
 
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.backends import default_backend
-
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-import threading
-import time
-
+# Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
+print("✅ CORS is enabled!")
 
-# --- Config ---
-ENCRYPTED_KEY_PATH = 'C:/Users/Kelse/Documents/Illinois_Tech/Courses/entropy_test/key.bin'
-PASSPHRASE = b'my_strong_passphrase_123'
-SALT = b'secure_salt'
+# Initialize Merkle Tree and Transactions list
+mt = MerkleTools(hash_type="sha256")
+transactions = []
 
-# --- In-memory blockchain state ---
-entropy_keys = []
-merkle_tree, merkle_root = [], ''
+# Endpoint to send a transaction
+@app.route('/api/send-transaction', methods=['POST'])
+def send_transaction():
+    data = request.get_json()
+    print("🚀 Incoming transaction payload:", data)
 
-# --- Merkle & Cryptography Helpers ---
-def sha256(data: str) -> str:
-    return hashlib.sha256(data.encode()).hexdigest()
+    sender = data.get('sender')
+    recipient = data.get('recipient')
+    amount = data.get('amount')
 
-def derive_key(passphrase: bytes, salt: bytes) -> bytes:
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=100000,
-        backend=default_backend()
-    )
-    return base64.urlsafe_b64encode(kdf.derive(passphrase))
+    if not sender or not recipient or not amount:
+        return jsonify({"error": "Missing sender, recipient, or amount."}), 400
 
-def load_encrypted_key():
-    try:
-        with open(ENCRYPTED_KEY_PATH, 'rb') as f:
-            encrypted_data = f.read()
+    transaction_string = f"{sender}->{recipient}:{amount}"
+    transaction_hash = hashlib.sha256(transaction_string.encode()).hexdigest()
 
-        key = derive_key(PASSPHRASE, SALT)
-        cipher = Fernet(key)
-        decrypted = cipher.decrypt(encrypted_data)
-        return decrypted.decode()
-    except Exception as e:
-        print("Decryption failed:", e)
-        return None
+    # ✅ Capture the index BEFORE make_tree
+    mt.add_leaf(transaction_hash, do_hash=False)
+    leaf_index = len(mt.leaves) - 1  # <-- New leaf is always at the last index
 
-def build_merkle_tree(hashes):
-    if not hashes:
-        return [], ''
-    tree = [hashes[:]]
-    while len(tree[-1]) > 1:
-        level = []
-        for i in range(0, len(tree[-1]), 2):
-            left = tree[-1][i]
-            right = tree[-1][i+1] if i+1 < len(tree[-1]) else left
-            level.append(sha256(left + right))
-        tree.append(level)
-    return tree, tree[-1][0]
+    mt.make_tree()
 
-def generate_merkle_proof(tree, index):
-    proof = []
-    for level in tree[:-1]:
-        sibling_index = index ^ 1
-        if sibling_index < len(level):
-            proof.append(level[sibling_index])
-        index //= 2
-    return proof
+    proof = mt.get_proof(leaf_index)
+    merkle_root = mt.get_merkle_root()
 
-def verify_merkle_proof(leaf, proof, root):
-    hash = sha256(leaf)
-    for sibling in proof:
-        combined = hash + sibling if hash < sibling else sibling + hash
-        hash = sha256(combined)
-    return hash == root
-
-# --- Key Refresh Logic ---
-def refresh_entropy_key():
-    real_key = load_encrypted_key()
-    if real_key:
-        entropy_keys.clear()
-        entropy_keys.append(real_key)
-
-        hashed_keys = [sha256(k) for k in entropy_keys]
-        global merkle_tree, merkle_root
-        merkle_tree, merkle_root = build_merkle_tree(hashed_keys)
-        print("[Watcher] Merkle tree updated with new key.")
-
-# --- File Watcher Class ---
-class KeyFileHandler(FileSystemEventHandler):
-    def on_modified(self, event):
-        if event.src_path.endswith("device_key_encrypted.bin"):
-            print(f"[Watcher] Detected key file update: {event.src_path}")
-            refresh_entropy_key()
-
-def start_watcher():
-    event_handler = KeyFileHandler()
-    observer = Observer()
-    watch_dir = os.path.dirname(ENCRYPTED_KEY_PATH)
-    observer.schedule(event_handler, watch_dir, recursive=False)
-    observer.start()
-    print(f"[Watcher] Monitoring directory: {watch_dir}")
-
-    # Keep the thread alive
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
-
-# --- Flask Routes ---
-@app.route('/api/latest-block', methods=['GET'])
-def get_latest_block():
-    return jsonify({
-        'timestamp': str(datetime.now()),
-        'entropy_keys': entropy_keys,
-        'merkle_root': merkle_root,
-        'hash': sha256(merkle_root + str(datetime.now())),
+    transactions.append({
+        "sender": sender,
+        "recipient": recipient,
+        "amount": amount,
+        "hash": transaction_hash,
+        "proof": proof,
+        "merkle_root": merkle_root
     })
 
-@app.route('/api/verify-merkle', methods=['POST'])
-def verify():
-    key = request.json.get('key')
-    try:
-        index = entropy_keys.index(key)
-        proof = generate_merkle_proof([sha256(k) for k in entropy_keys], index)
-        valid = verify_merkle_proof(key, proof, merkle_root)
-        return jsonify({'valid': valid, 'proof_path': proof})
-    except ValueError:
-        return jsonify({'valid': False, 'error': 'Key not found'}), 400
+    return jsonify({
+        "transaction_hash": transaction_hash,
+        "merkle_root": merkle_root,
+        "proof": proof
+    }), 200
 
-# --- Launch Flask + Watcher ---
+
+# Endpoint to get all transactions
+@app.route('/api/get-transactions', methods=['GET'])
+def get_transactions():
+    return jsonify({"transactions": transactions}), 200
+
+# Endpoint to verify a transaction proof
+@app.route('/api/verify-transaction', methods=['POST'])
+def verify_transaction():
+    data = request.get_json()
+    transaction_hash = data.get('transaction_hash')
+    proof = data.get('proof')
+    merkle_root = data.get('merkle_root')
+
+    if not transaction_hash or not proof or not merkle_root:
+        return jsonify({"error": "Missing transaction hash, proof, or merkle root."}), 400
+
+    is_valid = mt.validate_proof(proof, transaction_hash, merkle_root)
+
+    return jsonify({"valid": is_valid}), 200
+
+# Run the Flask app
 if __name__ == '__main__':
-    # Load initial key if it exists
-    refresh_entropy_key()
-
-    # Start watcher in separate thread
-    watcher_thread = threading.Thread(target=start_watcher, daemon=True)
-    watcher_thread.start()
-
-    # Start Flask server
-    app.run(port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
