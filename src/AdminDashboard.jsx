@@ -1,10 +1,11 @@
-// AdminDashboard.jsx
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
   const [transactions, setTransactions] = useState([]);
+  const [entropyKey, setEntropyKey] = useState(null);
+  const [entropyTimestamp, setEntropyTimestamp] = useState(null);
 
   useEffect(() => {
     const user = JSON.parse(localStorage.getItem('currentUser'));
@@ -12,20 +13,119 @@ export default function AdminDashboard() {
       navigate('/login');
     }
     fetchTransactions();
-    const interval = setInterval(fetchTransactions, 5000); // Auto-refresh every 5 seconds
+    fetchEntropyKey();
+
+    const interval = setInterval(() => {
+      fetchTransactions();
+      fetchEntropyKey();
+    }, 5000);
+
     return () => clearInterval(interval);
   }, [navigate]);
 
   const fetchTransactions = async () => {
     try {
-      const response = await fetch('http://127.0.0.1:5000/api/get-transactions');
-      if (response.ok) {
-        const data = await response.json();
-        const enrichedTransactions = data.transactions.map(txn => ({ ...txn, verified: null }));
-        setTransactions(enrichedTransactions);
-      }
-    } catch (error) {
-      console.error('Error fetching transactions:', error);
+      const res = await fetch('http://127.0.0.1:5000/api/get-transactions');
+      if (!res.ok) return;
+
+      const data = await res.json();
+
+      const enriched = await Promise.all(
+        data.transactions.map(async (txn) => {
+          const txnStr = `${txn.sender}->${txn.recipient}:${txn.amount}`;
+
+          // Verify signature and derive wallet address
+          const sigResult = await verifySignature(txnStr, txn.signature, txn.public_key);
+
+          // Verify Merkle proof
+          const merkleValid = await verifyMerkleProofDirect(txn);
+
+          return {
+            ...txn,
+            signature_valid: sigResult.valid,
+            signer_suffix: sigResult.shortKey,
+            wallet_address: sigResult.walletAddress,
+            merkle_valid: merkleValid
+          };
+        })
+      );
+
+      setTransactions(enriched);
+    } catch (err) {
+      console.error("❌ Error fetching transactions:", err);
+    }
+  };
+
+  const fetchEntropyKey = async () => {
+    try {
+      const res = await fetch('http://127.0.0.1:5000/api/latest-entropy-key');
+      if (!res.ok) return;
+
+      const data = await res.json();
+      setEntropyKey(data.entropy_key);
+      setEntropyTimestamp(data.timestamp);
+    } catch (err) {
+      console.error("❌ Error fetching entropy key:", err);
+    }
+  };
+
+  const verifySignature = async (txnStr, signature, pubKey) => {
+    try {
+      const res = await fetch('http://127.0.0.1:5000/api/verify-signature', {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          transaction: txnStr,
+          signature,
+          public_key: pubKey
+        })
+      });
+
+      if (!res.ok) return { valid: false };
+
+      const result = await res.json();
+
+      // Derive short fingerprint from public key hash
+      const hash = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(pubKey)
+      );
+      const hex = Array.from(new Uint8Array(hash))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      const suffix = hex.slice(-4);
+      const walletAddr = "0x" + hex.slice(-8);
+
+      return {
+        valid: result.valid,
+        shortKey: suffix,
+        walletAddress: walletAddr
+      };
+    } catch (err) {
+      console.error("❌ Signature verification error:", err);
+      return { valid: false };
+    }
+  };
+
+  const verifyMerkleProofDirect = async (txn) => {
+    try {
+      const res = await fetch('http://127.0.0.1:5000/api/verify-transaction', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transaction_hash: txn.hash,
+          proof: txn.proof,
+          merkle_root: txn.merkle_root
+        })
+      });
+
+      if (!res.ok) return false;
+
+      const result = await res.json();
+      return result.valid;
+    } catch (err) {
+      console.error("❌ Merkle verification error:", err);
+      return false;
     }
   };
 
@@ -34,71 +134,63 @@ export default function AdminDashboard() {
     navigate('/login');
   };
 
-  const verifyProof = async (txn, index) => {
-    try {
-      const response = await fetch('http://127.0.0.1:5000/api/verify-transaction', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          transaction_hash: txn.hash,
-          proof: txn.proof,
-          merkle_root: txn.merkle_root,
-        }),
-      });
-      if (response.ok) {
-        const result = await response.json();
-        const updatedTransactions = [...transactions];
-        updatedTransactions[index].verified = result.valid;
-        setTransactions(updatedTransactions);
-      } else {
-        console.error('Failed to verify proof.');
-      }
-    } catch (error) {
-      console.error('Error verifying proof:', error);
-    }
-  };
-
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
-      <div className="bg-white p-8 rounded-2xl shadow-md w-full max-w-6xl">
+      <div className="bg-white p-8 rounded-2xl shadow-md w-full max-w-7xl">
         <h1 className="text-2xl font-bold text-center mb-6">Admin Dashboard</h1>
-        <p className="text-center mb-6">Manage and verify transactions with Merkle Proofs</p>
+
+        {/* Entropy Key Status */}
+        <div className="mb-6 p-4 bg-gray-100 rounded-xl">
+          <h2 className="text-lg font-bold text-center">Device Connection Status</h2>
+          {entropyKey ? (
+            <div className="text-green-700 text-center mt-2">
+              <p><strong>Entropy Key Received</strong></p>
+              <p><strong>Last Updated:</strong> {entropyTimestamp}</p>
+            </div>
+          ) : (
+            <div className="text-red-500 text-center mt-2">
+              Waiting for entropy key from device...
+            </div>
+          )}
+        </div>
+
+        {/* Transactions */}
         <div className="overflow-x-auto">
+          <h2 className="text-lg font-bold mb-2">Signed Transactions</h2>
           <table className="min-w-full table-auto border">
             <thead>
-              <tr className="bg-gray-200">
-                <th className="border px-4 py-2">Sender</th>
-                <th className="border px-4 py-2">Recipient</th>
-                <th className="border px-4 py-2">Amount</th>
-                <th className="border px-4 py-2">Transaction Hash</th>
-                <th className="border px-4 py-2">Merkle Root</th>
-                <th className="border px-4 py-2">Action</th>
-                <th className="border px-4 py-2">Verification</th>
+              <tr className="bg-gray-200 text-sm">
+                <th className="border px-3 py-2">Sender</th>
+                <th className="border px-3 py-2">Recipient</th>
+                <th className="border px-3 py-2">Amount</th>
+                <th className="border px-3 py-2">Wallet</th>
+                <th className="border px-3 py-2">Signature</th>
+                <th className="border px-3 py-2">Merkle Proof</th>
               </tr>
             </thead>
             <tbody>
               {transactions.map((txn, index) => (
-                <tr key={index} className="text-center">
+                <tr key={index} className="text-center text-sm">
                   <td className="border px-2 py-1">{txn.sender}</td>
                   <td className="border px-2 py-1">{txn.recipient}</td>
                   <td className="border px-2 py-1">{txn.amount}</td>
-                  <td className="border px-2 py-1 text-xs">{txn.hash}</td>
-                  <td className="border px-2 py-1 text-xs">{txn.merkle_root}</td>
+                  <td className="border px-2 py-1 font-mono text-indigo-600">{txn.wallet_address}</td>
                   <td className="border px-2 py-1">
-                    <button
-                      onClick={() => verifyProof(txn, index)}
-                      className="bg-blue-500 text-white py-1 px-3 rounded-xl hover:bg-blue-600"
-                    >
-                      Verify Proof
-                    </button>
+                    {txn.signature_valid ? (
+                      <span className="text-green-600 font-semibold">
+                        ✅ by key ...{txn.signer_suffix}
+                      </span>
+                    ) : (
+                      <span className="text-red-500 font-semibold">❌ Invalid</span>
+                    )}
                   </td>
                   <td className="border px-2 py-1">
-                    {txn.verified === null ? (
-                      <span className="text-gray-400">Pending</span>
-                    ) : txn.verified ? (
-                      <span className="text-green-500 font-bold">Valid ✅</span>
+                    {txn.merkle_valid === true ? (
+                      <span className="text-green-600 font-semibold">✅ Valid</span>
+                    ) : txn.merkle_valid === false ? (
+                      <span className="text-red-500 font-semibold">❌ Invalid</span>
                     ) : (
-                      <span className="text-red-500 font-bold">Invalid ❌</span>
+                      <span className="text-gray-400">Pending</span>
                     )}
                   </td>
                 </tr>
@@ -106,9 +198,11 @@ export default function AdminDashboard() {
             </tbody>
           </table>
         </div>
+
+        {/* Logout */}
         <button
           onClick={handleLogout}
-          className="mt-6 bg-red-500 text-white py-2 rounded-xl hover:bg-red-600 w-full"
+          className="mt-8 bg-red-500 text-white py-2 rounded-xl hover:bg-red-600 w-full"
         >
           Log Out
         </button>
